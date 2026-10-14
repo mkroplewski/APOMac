@@ -68,10 +68,22 @@ public enum ConfigurationParser {
         guard let data = try? Data(contentsOf: url) else {
             throw ConfigurationFileError.unreadable(url)
         }
-        let text = String(data: data, encoding: .utf8)
+        return APOConfigurationFile(url: url, text: decode(data))
+    }
+
+    /// Decodes configuration text the way Windows editors commonly save it:
+    /// UTF-8 (with or without BOM), UTF-16 with BOM, or legacy Windows-1252.
+    public static func decode(_ data: Data) -> String {
+        if data.starts(with: [0xEF, 0xBB, 0xBF]) {
+            return String(decoding: data.dropFirst(3), as: UTF8.self)
+        }
+        if data.starts(with: [0xFF, 0xFE]) || data.starts(with: [0xFE, 0xFF]),
+           let text = String(data: data, encoding: .utf16) {
+            return text.hasPrefix("\u{FEFF}") ? String(text.dropFirst()) : text
+        }
+        return String(data: data, encoding: .utf8)
             ?? String(data: data, encoding: .windowsCP1252)
             ?? String(decoding: data, as: UTF8.self)
-        return APOConfigurationFile(url: url, text: text)
     }
 }
 

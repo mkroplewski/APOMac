@@ -123,6 +123,12 @@ public protocol APOCompiler: Sendable {
         profileRoot: URL,
         environment: APOEnvironment
     ) async -> Result<PreparedGraph, ConfigurationDiagnostics>
+
+    func compile(
+        source: String,
+        sourceURL: URL,
+        environment: APOEnvironment
+    ) async -> Result<PreparedGraph, ConfigurationDiagnostics>
 }
 
 public enum ChannelLayout {

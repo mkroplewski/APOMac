@@ -25,10 +25,7 @@ let package = Package(
         .executableTarget(
             name: "APOMacApp",
             dependencies: ["APOEngine", "APOAudioRuntime"],
-            path: "Sources/APOMacApp",
-            resources: [
-                .process("Resources")
-            ]
+            path: "Sources/APOMacApp"
         ),
         .testTarget(
             name: "APOEngineTests",

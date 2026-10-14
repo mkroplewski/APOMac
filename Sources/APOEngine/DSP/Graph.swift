@@ -32,24 +32,6 @@ private func biquadResponseMagnitude(_ coefficients: BiquadCoefficients, frequen
     return numerator / denominator
 }
 
-private func firResponseMagnitude(
-    coefficient: (Int) -> Double,
-    count: Int,
-    frequency: Double,
-    sampleRate: Double
-) -> Double {
-    let omega = 2.0 * Double.pi * frequency / max(sampleRate, 1.0)
-    var real = 0.0
-    var imaginary = 0.0
-    for index in 0..<count {
-        let phase = omega * Double(index)
-        let value = coefficient(index)
-        real += value * cos(phase)
-        imaginary -= value * sin(phase)
-    }
-    return hypot(real, imaginary)
-}
-
 internal final class PreampNode: RenderNode {
     let isInPlace = true
     let displayName: String
@@ -363,10 +345,10 @@ internal final class ScopedNode: RenderNode {
     private let inputScratch: PlanarBuffer
     private let outputScratch: PlanarBuffer
 
-    init(inner: RenderNode, selectedChannels: [Int], channelCount: Int, maxFrameCount: Int) {
+    init(inner: RenderNode, selectedChannels: [Int], channelNames: [String], channelCount: Int, maxFrameCount: Int) {
         self.inner = inner
         self.selectedChannels = selectedChannels
-        self.displayName = "\(inner.displayName) [\(selectedChannels.map(String.init).joined(separator: ", "))]"
+        self.displayName = "\(inner.displayName) [\(channelNames.joined(separator: ", "))]"
         self.inputScratch = PlanarBuffer(channelCount: channelCount, capacity: maxFrameCount)
         self.outputScratch = PlanarBuffer(channelCount: channelCount, capacity: maxFrameCount)
     }
@@ -378,10 +360,11 @@ internal final class ScopedNode: RenderNode {
         for channel in selectedChannels where channel >= 0 && channel < input.channelCount {
             inputScratch.channel(channel).update(from: input.channel(channel), count: frameCount)
         }
+        // Every node writes its result to `output`, in-place nodes included
+        // (the graph merely passes the same buffer twice for those).
         inner.process(input: inputScratch, output: outputScratch, frameCount: frameCount)
-        let processed = inner.isInPlace ? inputScratch : outputScratch
         for channel in selectedChannels where channel >= 0 && channel < output.channelCount {
-            output.channel(channel).update(from: processed.channel(channel), count: frameCount)
+            output.channel(channel).update(from: outputScratch.channel(channel), count: frameCount)
         }
     }
 
@@ -399,176 +382,84 @@ internal final class ScopedNode: RenderNode {
     }
 }
 
-internal class FIRNode: RenderNode {
+/// Per-channel FIR filtering (GraphicEQ, Convolution). Channels without a
+/// filter pass through unchanged.
+internal final class ConvolutionNode: RenderNode {
+    static let blockSize = 256
+
     let isInPlace = false
     let displayName: String
-    private let filterLength: Int
-    private let maxFrameCount: Int
-    private let filter: UnsafeMutablePointer<Float>
-    private let history: PlanarBuffer
-    private let work: PlanarBuffer
     private let channelCount: Int
+    private let convolvers: [PartitionedConvolver?]
+    private let responseSpectra: [[Float]?]
 
-    init(filter: [Float], channelCount: Int, maxFrameCount: Int, displayName: String) {
+    init(filters: [[Float]?], channelCount: Int, displayName: String) {
         self.displayName = displayName
-        let filterLength = max(1, filter.count)
-        let maximumFrameCount = max(1, maxFrameCount)
         self.channelCount = channelCount
-        let filterPointer = UnsafeMutablePointer<Float>.allocate(capacity: filterLength)
-        filterPointer.initialize(repeating: 0, count: filterLength)
-        filter.withUnsafeBufferPointer { pointer in
-            if let baseAddress = pointer.baseAddress {
-                filterPointer.update(from: baseAddress, count: min(filter.count, filterLength))
-            }
+        let fft = ConvolutionFFT(blockSize: Self.blockSize)
+        let channelFilters = (0..<channelCount).map { filters.indices.contains($0) ? filters[$0] : nil }
+        convolvers = channelFilters.map { filter in filter.map { PartitionedConvolver(filter: $0, fft: fft) } }
+        responseSpectra = channelFilters.map { filter in
+            filter.map { Self.magnitudeSpectrum(of: $0, size: $0.count == 1 ? 2 : max(16_384, 1 << Int(ceil(log2(Double($0.count)))))) }
         }
-        self.filterLength = filterLength
-        self.maxFrameCount = maximumFrameCount
-        self.filter = filterPointer
-        self.history = PlanarBuffer(channelCount: channelCount, capacity: max(1, filterLength - 1))
-        self.work = PlanarBuffer(channelCount: channelCount, capacity: max(1, filterLength - 1 + maximumFrameCount))
-    }
-
-    deinit {
-        filter.deinitialize(count: filterLength)
-        filter.deallocate()
     }
 
     func process(input: PlanarBuffer, output: PlanarBuffer, frameCount: Int) {
         guard frameCount > 0 else { return }
-        let count = min(frameCount, maxFrameCount)
-        if filterLength == 1 {
-            var scalar = filter[0]
-            withUnsafePointer(to: &scalar) { scalarPointer in
-                for channel in 0..<channelCount {
-                    vDSP_vsmul(input.channel(channel), 1, scalarPointer, output.channel(channel), 1, vDSP_Length(count))
-                }
-            }
-            return
-        }
-
-        let historyLength = filterLength - 1
         for channel in 0..<channelCount {
-            let workPointer = work.channel(channel)
-            workPointer.update(from: history.channel(channel), count: historyLength)
-            workPointer.advanced(by: historyLength).update(from: input.channel(channel), count: count)
-            vDSP_conv(
-                workPointer,
-                1,
-                filter.advanced(by: filterLength - 1),
-                -1,
-                output.channel(channel),
-                1,
-                vDSP_Length(count),
-                vDSP_Length(filterLength)
-            )
-            history.channel(channel).update(from: workPointer.advanced(by: count), count: historyLength)
+            if let convolver = convolvers[channel] {
+                convolver.process(input: input.channel(channel), output: output.channel(channel), frameCount: frameCount)
+            } else {
+                output.channel(channel).update(from: input.channel(channel), count: frameCount)
+            }
         }
     }
 
     func reset() {
-        history.clear(frameCount: history.capacity)
-        work.clear(frameCount: work.capacity)
+        for convolver in convolvers { convolver?.reset() }
     }
 
     func responseMagnitude(frequency: Double, sampleRate: Double, channel: Int) -> Double {
-        firResponseMagnitude(
-            coefficient: { Double(filter[$0]) },
-            count: filterLength,
-            frequency: frequency,
-            sampleRate: sampleRate
-        )
+        guard responseSpectra.indices.contains(channel), let spectrum = responseSpectra[channel] else { return 1 }
+        if spectrum.count == 1 { return Double(spectrum[0]) }
+        let size = (spectrum.count - 1) * 2
+        let position = min(max(frequency / sampleRate * Double(size), 0), Double(spectrum.count - 1))
+        let lower = Int(position)
+        let upper = min(lower + 1, spectrum.count - 1)
+        let amount = Float(position - Double(lower))
+        return Double(spectrum[lower] * (1 - amount) + spectrum[upper] * amount)
     }
-}
 
-internal final class MultiFIRNode: RenderNode {
-    let isInPlace = false
-    let displayName: String
-    private let filterLengths: [Int]
-    private let maxFrameCount: Int
-    private let filters: UnsafeMutablePointer<UnsafeMutablePointer<Float>>
-    private let histories: PlanarBuffer
-    private let work: PlanarBuffer
-    private let channelCount: Int
-    private let maxHistoryLength: Int
-
-    init(filters sourceFilters: [[Float]], channelCount: Int, maxFrameCount: Int, displayName: String) {
-        self.displayName = displayName
-        self.channelCount = channelCount
-        let maximumFrameCount = max(1, maxFrameCount)
-        let lengths = (0..<channelCount).map { max(1, sourceFilters.indices.contains($0) ? sourceFilters[$0].count : 1) }
-        let maximumHistoryLength = max(1, (lengths.max() ?? 1) - 1)
-        let filterPointers = UnsafeMutablePointer<UnsafeMutablePointer<Float>>.allocate(capacity: channelCount)
-        for channel in 0..<channelCount {
-            let source = sourceFilters.indices.contains(channel) && !sourceFilters[channel].isEmpty ? sourceFilters[channel] : [Float(1)]
-            let pointer = UnsafeMutablePointer<Float>.allocate(capacity: lengths[channel])
-            pointer.initialize(repeating: 0, count: lengths[channel])
-            source.withUnsafeBufferPointer { buffer in
-                if let baseAddress = buffer.baseAddress {
-                    pointer.update(from: baseAddress, count: min(source.count, lengths[channel]))
+    /// Magnitude at bins 0...size/2 (a single value for one-tap filters).
+    private static func magnitudeSpectrum(of filter: [Float], size: Int) -> [Float] {
+        if filter.count == 1 { return [abs(filter[0])] }
+        let log2n = vDSP_Length(log2(Double(size)))
+        guard let setup = vDSP_create_fftsetup(log2n, FFTRadix(kFFTRadix2)) else { return [1] }
+        defer { vDSP_destroy_fftsetup(setup) }
+        let half = size / 2
+        var padded = [Float](repeating: 0, count: size)
+        padded.replaceSubrange(0..<min(filter.count, size), with: filter.prefix(size))
+        var real = [Float](repeating: 0, count: half)
+        var imaginary = [Float](repeating: 0, count: half)
+        var magnitudes = [Float](repeating: 0, count: half + 1)
+        real.withUnsafeMutableBufferPointer { realBuffer in
+            imaginary.withUnsafeMutableBufferPointer { imaginaryBuffer in
+                var split = DSPSplitComplex(realp: realBuffer.baseAddress!, imagp: imaginaryBuffer.baseAddress!)
+                padded.withUnsafeBufferPointer { paddedBuffer in
+                    paddedBuffer.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: half) {
+                        vDSP_ctoz($0, 2, &split, 1, vDSP_Length(half))
+                    }
+                }
+                vDSP_fft_zrip(setup, &split, 1, log2n, FFTDirection(kFFTDirection_Forward))
+                // Forward real FFT is scaled by 2.
+                magnitudes[0] = abs(realBuffer[0]) / 2
+                magnitudes[half] = abs(imaginaryBuffer[0]) / 2
+                for bin in 1..<half {
+                    magnitudes[bin] = hypot(realBuffer[bin], imaginaryBuffer[bin]) / 2
                 }
             }
-            filterPointers[channel] = pointer
         }
-        self.maxFrameCount = maximumFrameCount
-        self.filterLengths = lengths
-        self.maxHistoryLength = maximumHistoryLength
-        self.filters = filterPointers
-        self.histories = PlanarBuffer(channelCount: channelCount, capacity: maximumHistoryLength)
-        self.work = PlanarBuffer(channelCount: channelCount, capacity: maximumHistoryLength + maximumFrameCount)
-    }
-
-    deinit {
-        for channel in 0..<channelCount {
-            filters[channel].deinitialize(count: filterLengths[channel])
-            filters[channel].deallocate()
-        }
-        filters.deallocate()
-    }
-
-    func process(input: PlanarBuffer, output: PlanarBuffer, frameCount: Int) {
-        let count = min(frameCount, maxFrameCount)
-        guard count > 0 else { return }
-        for channel in 0..<channelCount {
-            let length = filterLengths[channel]
-            if length == 1 {
-                var scalar = filters[channel][0]
-                withUnsafePointer(to: &scalar) { scalarPointer in
-                    vDSP_vsmul(input.channel(channel), 1, scalarPointer, output.channel(channel), 1, vDSP_Length(count))
-                }
-                continue
-            }
-            let historyLength = length - 1
-            let workPointer = work.channel(channel)
-            workPointer.update(from: histories.channel(channel), count: historyLength)
-            workPointer.advanced(by: historyLength).update(from: input.channel(channel), count: count)
-            vDSP_conv(
-                workPointer,
-                1,
-                filters[channel].advanced(by: length - 1),
-                -1,
-                output.channel(channel),
-                1,
-                vDSP_Length(count),
-                vDSP_Length(length)
-            )
-            histories.channel(channel).update(from: workPointer.advanced(by: count), count: historyLength)
-        }
-    }
-
-    func reset() {
-        histories.clear(frameCount: histories.capacity)
-        work.clear(frameCount: work.capacity)
-    }
-
-    func responseMagnitude(frequency: Double, sampleRate: Double, channel: Int) -> Double {
-        guard channel >= 0, channel < channelCount else { return 1 }
-        let filterPointer = filters[channel]
-        return firResponseMagnitude(
-            coefficient: { Double(filterPointer[$0]) },
-            count: filterLengths[channel],
-            frequency: frequency,
-            sampleRate: sampleRate
-        )
+        return magnitudes
     }
 }
 
@@ -603,20 +494,29 @@ public final class PreparedGraph: @unchecked Sendable {
         output: UnsafeMutablePointer<Float>,
         frameCount: Int
     ) {
-        let count = min(max(0, frameCount), maxFrameCount)
-        guard count > 0 else { return }
-        buffers.current.deinterleave(from: input, frameCount: count)
-        for node in nodes {
-            let current = buffers.current
-            let destination = node.isInPlace ? current : buffers.scratch
-            node.process(input: current, output: destination, frameCount: count)
-            if !node.isInPlace { buffers.swap() }
-        }
-        buffers.current.interleave(to: output, frameCount: count)
-        if frameCount > count {
-            output.advanced(by: count * channelCount).update(repeating: 0, count: (frameCount - count) * channelCount)
+        var offset = 0
+        while offset < frameCount {
+            let count = min(frameCount - offset, maxFrameCount)
+            let sampleOffset = offset * channelCount
+            buffers.current.deinterleave(from: input + sampleOffset, frameCount: count)
+            for node in nodes {
+                let current = buffers.current
+                let destination = node.isInPlace ? current : buffers.scratch
+                node.process(input: current, output: destination, frameCount: count)
+                if !node.isInPlace { buffers.swap() }
+            }
+            buffers.current.interleave(to: output + sampleOffset, frameCount: count)
+            offset += count
         }
     }
+
+    /// A graph that copies input to output; used before a profile is compiled
+    /// and for bypass.
+    public static func passthrough(channelCount: Int, maxFrameCount: Int, sampleRate: Double) -> PreparedGraph {
+        PreparedGraph(channelCount: channelCount, maxFrameCount: maxFrameCount, sampleRate: sampleRate, nodes: [])
+    }
+
+    public var isPassthrough: Bool { nodes.isEmpty }
 
     public func reset() {
         buffers.first.clear(frameCount: maxFrameCount)
@@ -626,6 +526,11 @@ public final class PreparedGraph: @unchecked Sendable {
 
     public var responseIsApproximate: Bool {
         nodes.contains(where: \.responseIsApproximate)
+    }
+
+    /// One response curve per output channel.
+    public func frequencyResponses(pointCount: Int = 256) -> [[APOFrequencyResponsePoint]] {
+        (0..<channelCount).map { frequencyResponse(pointCount: pointCount, channel: $0) }
     }
 
     public func frequencyResponse(

@@ -1,4 +1,5 @@
 import APOEngine
+import AudioToolbox
 import CoreAudio
 import Darwin
 import Foundation
@@ -22,25 +23,41 @@ public struct AudioDeviceInfo: Identifiable, Hashable, Sendable {
     }
 }
 
+/// The format the running session processes; profiles must be compiled for it.
+public struct AudioOutputFormat: Sendable, Equatable {
+    public let deviceUID: String
+    public let deviceName: String
+    public let sampleRate: Double
+    public let channelCount: Int
+}
+
 public enum AudioSessionState: Sendable, Equatable {
     case stopped
-    case starting
     case running
-    case bypassed
     case failed(String)
 }
 
 public enum AudioSessionError: Error, LocalizedError {
     case noOutputDevice
-    case unsupportedFormat
+    case unsupportedFormat(String)
     case operatingSystem(OSStatus, String)
 
     public var errorDescription: String? {
         switch self {
-        case .noOutputDevice: return "No Core Audio output device is available"
-        case .unsupportedFormat: return "The selected Core Audio device is not Float32 PCM"
-        case .operatingSystem(let status, let operation): return "\(operation) failed with OSStatus \(status)"
+        case .noOutputDevice:
+            return "No output device is available."
+        case .unsupportedFormat(let detail):
+            return "The output device uses an unsupported audio format (\(detail))."
+        case .operatingSystem(let status, let operation):
+            return "\(operation) failed (OSStatus \(status))."
         }
+    }
+
+    /// Tap creation fails like this when system audio recording permission
+    /// has not been granted.
+    public var isLikelyPermissionDenied: Bool {
+        if case .operatingSystem(_, let operation) = self { return operation == "Creating the system audio tap" }
+        return false
     }
 }
 
@@ -51,203 +68,343 @@ public enum AudioDeviceCatalog {
             guard (try? device.canBeDefaultOutputDevice) == true else { return nil }
             let input = (try? device.inputStreamConfiguration.reduce(0) { $0 + Int($1.mNumberChannels) }) ?? 0
             let output = (try? device.outputStreamConfiguration.reduce(0) { $0 + Int($1.mNumberChannels) }) ?? 0
-            guard output > 0 else { return nil }
+            let uid = (try? device.uid) ?? ""
+            // Our own private processing device is not a user-facing output.
+            guard output > 0, !uid.hasPrefix(AudioSession.aggregateUIDPrefix) else { return nil }
             return AudioDeviceInfo(
                 id: device.id,
-                uid: (try? device.uid) ?? "",
-                name: (try? device.name) ?? "Unknown output",
-                sampleRate: (try? device.actualSampleRate) ?? 48_000,
+                uid: uid,
+                name: ((try? device.name) ?? "Unknown output").trimmingCharacters(in: .whitespacesAndNewlines),
+                sampleRate: (try? device.nominalSampleRate) ?? 48_000,
                 inputChannelCount: input,
                 outputChannelCount: output
             )
         }
     }
+
+    public static func defaultOutputDeviceUID() -> String? {
+        try? AudioHardwareSystem.shared.defaultOutputDevice?.uid
+    }
+
+    /// Changes the macOS sound output, exactly like choosing it in Control Center.
+    public static func setDefaultOutputDevice(uid: String) throws {
+        guard let device = try AudioHardwareSystem.shared.device(forUID: uid) else {
+            throw AudioSessionError.noOutputDevice
+        }
+        try AudioHardwareSystem.shared.setDefaultOutputDevice(device)
+    }
+
+    /// Calls `handler` on the main queue whenever devices appear, disappear or
+    /// the default output changes. Keep the returned token alive.
+    public static func observeChanges(_ handler: @escaping @Sendable () -> Void) -> AnyObject {
+        let observer = PropertyObserver()
+        observer.add(objectID: AudioObjectID(kAudioObjectSystemObject), selector: kAudioHardwarePropertyDevices, handler: handler)
+        observer.add(objectID: AudioObjectID(kAudioObjectSystemObject), selector: kAudioHardwarePropertyDefaultOutputDevice, handler: handler)
+        return observer
+    }
 }
 
+/// Owns the Core Audio objects for system-wide processing.
+///
+/// A private process tap captures (and mutes) everything other apps play to
+/// the output device. The tap and the output device are combined into one
+/// private aggregate device, so a single IOProc reads the tapped audio and
+/// writes the processed audio on the same clock. The tap is drift
+/// compensated by the HAL, so there is no ring buffer, no clock drift and no
+/// sample-rate mismatch between capture and playback.
+///
+/// Use from the main thread.
 public final class AudioSession: @unchecked Sendable {
+    static let aggregateUIDPrefix = "com.apomac.aggregate."
+
     public private(set) var state: AudioSessionState = .stopped
-    public var underrunCount: Int { underruns.load(ordering: .relaxed) }
+    public private(set) var format: AudioOutputFormat?
+    /// Called on the main queue when the running device changes format or
+    /// disappears; the owner should restart the session.
+    public var onDeviceChange: (@Sendable () -> Void)?
 
     private var tap: AudioHardwareTap?
     private var aggregateDevice: AudioHardwareAggregateDevice?
-    private var outputDevice: AudioHardwareDevice?
-    private var inputIOProcID: AudioDeviceIOProcID?
-    private var outputIOProcID: AudioDeviceIOProcID?
-    private var ring: AudioRingBuffer?
-    private var crossfader: GraphCrossfader?
-    private var tapScratch: UnsafeMutablePointer<Float>?
-    private var outputScratch: UnsafeMutablePointer<Float>?
-    private let underruns = Synchronization.Atomic<Int>(0)
-    private var channelCount = 2
-    private var maxFrameCount = 4096
+    private var ioProcID: AudioDeviceIOProcID?
+    private var renderer: Renderer?
+    private var observer: PropertyObserver?
 
     public init() {}
 
     deinit { stop() }
 
-    public func start(graph: PreparedGraph, deviceUID: String? = nil) throws {
+    /// Fraction of the IO cycle spent processing (smoothed), 0...1+.
+    public var dspLoad: Double {
+        Double(renderer?.loadPermille.load(ordering: .relaxed) ?? 0) / 1000
+    }
+
+    /// Starts processing on `deviceUID` (or the current default output).
+    /// Audio passes through unprocessed until a graph is installed.
+    @discardableResult
+    public func start(deviceUID: String?) throws -> AudioOutputFormat {
         stop()
-        state = .starting
         do {
-            let system = AudioHardwareSystem.shared
-            guard let output = try (deviceUID.flatMap { try? system.device(forUID: $0) } ?? system.defaultOutputDevice) else {
-                throw AudioSessionError.noOutputDevice
-            }
-            let outputBuffers = try output.outputStreamConfiguration
-            channelCount = max(1, outputBuffers.reduce(0) { $0 + Int($1.mNumberChannels) })
-            maxFrameCount = max(256, (try? output.bufferFrameSize) ?? 4096)
-            guard channelCount == graph.channelCount else { throw AudioSessionError.unsupportedFormat }
-
-            let sampleCapacity = channelCount * maxFrameCount
-            ring = AudioRingBuffer(channelCount: channelCount, capacityFrames: maxFrameCount * 8)
-            crossfader = GraphCrossfader(sampleRate: (try? output.actualSampleRate) ?? 48_000, channelCount: channelCount, maxFrameCount: maxFrameCount)
-            _ = crossfader?.install(graph)
-            tapScratch = .allocate(capacity: sampleCapacity)
-            tapScratch?.initialize(repeating: 0, count: sampleCapacity)
-            outputScratch = .allocate(capacity: sampleCapacity)
-            outputScratch?.initialize(repeating: 0, count: sampleCapacity)
-
-            let ownProcessID = (try? system.process(for: getpid()))?.id
-            let excludedProcesses = ownProcessID.map { [$0] } ?? []
-            let description: CATapDescription
-            if channelCount == 2 {
-                description = CATapDescription(stereoGlobalTapButExcludeProcesses: excludedProcesses)
-            } else {
-                description = CATapDescription(
-                    excludingProcesses: excludedProcesses,
-                    deviceUID: try output.uid,
-                    stream: 0
-                )
-            }
-            description.muteBehavior = .mutedWhenTapped
-            description.isPrivate = true
-            tap = try system.makeProcessTap(description: description)
-            guard let tap else { throw AudioSessionError.operatingSystem(-1, "Creating process tap") }
-            let tapFormat = try tap.format
-            guard Int(tapFormat.mChannelsPerFrame) == channelCount,
-                  tapFormat.mFormatID == kAudioFormatLinearPCM,
-                  tapFormat.mBitsPerChannel == 32,
-                  tapFormat.mFormatFlags & kAudioFormatFlagIsFloat != 0 else {
-                throw AudioSessionError.unsupportedFormat
-            }
-
-            let composition: [String: Any] = [
-                kAudioAggregateDeviceNameKey as String: "APOMac Tap",
-                kAudioAggregateDeviceUIDKey as String: "com.apomac.tap.\(UUID().uuidString)",
-                kAudioAggregateDeviceIsPrivateKey as String: true,
-                kAudioAggregateDeviceTapListKey as String: [[kAudioSubTapUIDKey as String: try tap.uid]],
-                kAudioAggregateDeviceTapAutoStartKey as String: true
-            ]
-            aggregateDevice = try system.makeAggregateDevice(description: composition)
-            guard let aggregateDevice else { throw AudioSessionError.operatingSystem(-2, "Creating aggregate tap device") }
-            outputDevice = output
-
-            var inputProc: AudioDeviceIOProcID?
-            let inputStatus = AudioDeviceCreateIOProcIDWithBlock(&inputProc, aggregateDevice.id, nil) { [weak self] _, inputData, _, _, _ in
-                self?.receiveTap(inputData)
-            }
-            guard inputStatus == noErr, let inputProc else { throw AudioSessionError.operatingSystem(inputStatus, "Creating tap input client") }
-            inputIOProcID = inputProc
-
-            var outputProc: AudioDeviceIOProcID?
-            let outputStatus = AudioDeviceCreateIOProcIDWithBlock(&outputProc, output.id, nil) { [weak self] _, _, _, outputData, _ in
-                self?.renderOutput(outputData)
-            }
-            guard outputStatus == noErr, let outputProc else { throw AudioSessionError.operatingSystem(outputStatus, "Creating physical output client") }
-            outputIOProcID = outputProc
-
-            let startOutputStatus = AudioDeviceStart(output.id, outputProc)
-            guard startOutputStatus == noErr else { throw AudioSessionError.operatingSystem(startOutputStatus, "Starting physical output") }
-            let startInputStatus = AudioDeviceStart(aggregateDevice.id, inputProc)
-            guard startInputStatus == noErr else { throw AudioSessionError.operatingSystem(startInputStatus, "Starting aggregate tap") }
+            let format = try startUnchecked(deviceUID: deviceUID)
+            self.format = format
             state = .running
+            return format
         } catch {
             stop()
-            state = .bypassed
+            state = .failed(error.localizedDescription)
             throw error
         }
     }
 
+    /// Crossfades to `graph`. Returns false if the graph was compiled for a
+    /// different format than the running session.
+    @discardableResult
     public func install(graph: PreparedGraph) -> Bool {
-        crossfader?.install(graph) ?? false
+        guard let renderer, let format,
+              graph.channelCount == format.channelCount,
+              abs(graph.sampleRate - format.sampleRate) < 0.5 else { return false }
+        return renderer.crossfader.install(graph)
     }
 
     public func stop() {
-        if let outputDevice, let outputIOProcID {
-            _ = AudioDeviceStop(outputDevice.id, outputIOProcID)
-            _ = AudioDeviceDestroyIOProcID(outputDevice.id, outputIOProcID)
-        }
-        if let aggregateDevice, let inputIOProcID {
-            _ = AudioDeviceStop(aggregateDevice.id, inputIOProcID)
-            _ = AudioDeviceDestroyIOProcID(aggregateDevice.id, inputIOProcID)
+        observer = nil
+        if let aggregateDevice, let ioProcID {
+            _ = AudioDeviceStop(aggregateDevice.id, ioProcID)
+            _ = AudioDeviceDestroyIOProcID(aggregateDevice.id, ioProcID)
         }
         if let aggregateDevice { try? AudioHardwareSystem.shared.destroyAggregateDevice(aggregateDevice) }
         if let tap { try? AudioHardwareSystem.shared.destroyProcessTap(tap) }
-        if let tapScratch {
-            tapScratch.deinitialize(count: channelCount * maxFrameCount)
-            tapScratch.deallocate()
-        }
-        if let outputScratch {
-            outputScratch.deinitialize(count: channelCount * maxFrameCount)
-            outputScratch.deallocate()
-        }
-        tap = nil
+        // The IOProc is gone, so the renderer can release its graphs here.
+        renderer?.crossfader.releaseAll()
+        ioProcID = nil
         aggregateDevice = nil
-        outputDevice = nil
-        inputIOProcID = nil
-        outputIOProcID = nil
-        tapScratch = nil
-        outputScratch = nil
-        ring = nil
-        crossfader = nil
+        tap = nil
+        renderer = nil
+        format = nil
         state = .stopped
     }
 
-    private func receiveTap(_ inputData: UnsafePointer<AudioBufferList>?) {
-        guard let inputData, let scratch = tapScratch, let crossfader, let ring else { return }
-        let buffers = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inputData))
-        let firstBufferChannels = max(1, Int(buffers.first?.mNumberChannels ?? 1))
-        let frames = min(maxFrameCount, buffers.first.map { Int($0.mDataByteSize) / (MemoryLayout<Float>.size * firstBufferChannels) } ?? 0)
-        guard frames > 0 else { return }
-        for frame in 0..<frames {
-            for channel in 0..<channelCount {
-                let buffer = buffers.indices.contains(channel) ? buffers[channel] : buffers.first!
-                if let data = buffer.mData {
-                    if buffers.count == 1 {
-                        scratch[frame * channelCount + channel] = data.assumingMemoryBound(to: Float.self)[frame * channelCount + channel]
-                    } else {
-                        scratch[frame * channelCount + channel] = data.assumingMemoryBound(to: Float.self)[frame]
-                    }
-                } else {
-                    scratch[frame * channelCount + channel] = 0
-                }
-            }
+    private func startUnchecked(deviceUID: String?) throws -> AudioOutputFormat {
+        let system = AudioHardwareSystem.shared
+        let requested = try deviceUID.flatMap { try system.device(forUID: $0) }
+        guard let output = try requested ?? system.defaultOutputDevice else {
+            throw AudioSessionError.noOutputDevice
         }
-        crossfader.process(input: scratch, output: scratch, frameCount: frames)
-        ring.write(scratch, frameCount: frames)
+        let outputUID = try output.uid
+        let outputName = ((try? output.name) ?? "Output").trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let ownProcess = try? system.process(for: getpid())
+        let tapDescription = CATapDescription(
+            excludingProcesses: ownProcess.map { [$0.id] } ?? [],
+            deviceUID: outputUID,
+            stream: 0
+        )
+        tapDescription.name = "APOMac"
+        tapDescription.muteBehavior = .mutedWhenTapped
+        tapDescription.isPrivate = true
+        let tap: AudioHardwareTap?
+        do {
+            tap = try system.makeProcessTap(description: tapDescription)
+        } catch let error as AudioHardwareError {
+            throw AudioSessionError.operatingSystem(error.error, "Creating the system audio tap")
+        }
+        guard let tap else { throw AudioSessionError.operatingSystem(-1, "Creating the system audio tap") }
+        self.tap = tap
+
+        let tapFormat = try tap.format
+        guard tapFormat.mFormatID == kAudioFormatLinearPCM,
+              tapFormat.mBitsPerChannel == 32,
+              tapFormat.mFormatFlags & kAudioFormatFlagIsFloat != 0 else {
+            throw AudioSessionError.unsupportedFormat("tap is not 32-bit float PCM")
+        }
+
+        let composition: [String: Any] = [
+            kAudioAggregateDeviceNameKey: "APOMac",
+            kAudioAggregateDeviceUIDKey: Self.aggregateUIDPrefix + UUID().uuidString,
+            kAudioAggregateDeviceMainSubDeviceKey: outputUID,
+            kAudioAggregateDeviceIsPrivateKey: true,
+            kAudioAggregateDeviceIsStackedKey: false,
+            kAudioAggregateDeviceTapAutoStartKey: true,
+            kAudioAggregateDeviceSubDeviceListKey: [[kAudioSubDeviceUIDKey: outputUID]],
+            kAudioAggregateDeviceTapListKey: [[
+                kAudioSubTapUIDKey: try tap.uid,
+                kAudioSubTapDriftCompensationKey: true
+            ]]
+        ]
+        let aggregate: AudioHardwareAggregateDevice?
+        do {
+            aggregate = try system.makeAggregateDevice(description: composition)
+        } catch let error as AudioHardwareError {
+            throw AudioSessionError.operatingSystem(error.error, "Creating the processing device")
+        }
+        guard let aggregate else { throw AudioSessionError.operatingSystem(-1, "Creating the processing device") }
+        aggregateDevice = aggregate
+
+        let sampleRate = try aggregate.nominalSampleRate
+        let outputBuffers = try aggregate.outputStreamConfiguration
+        let channelCount = outputBuffers.reduce(0) { $0 + Int($1.mNumberChannels) }
+        guard channelCount > 0, sampleRate > 0 else {
+            throw AudioSessionError.unsupportedFormat("no output channels")
+        }
+        // Aggregate inputs list the sub-device's own inputs (e.g. a headset
+        // microphone) first and the tap last.
+        let inputBuffers = try aggregate.inputStreamConfiguration
+        let tapIsInterleaved = tapFormat.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
+        let tapBufferCount = tapIsInterleaved ? 1 : Int(tapFormat.mChannelsPerFrame)
+        let tapBufferOffset = max(0, inputBuffers.count - tapBufferCount)
+
+        let renderer = Renderer(
+            sampleRate: sampleRate,
+            channelCount: channelCount,
+            tapBufferOffset: tapBufferOffset
+        )
+        self.renderer = renderer
+
+        var procID: AudioDeviceIOProcID?
+        let status = AudioDeviceCreateIOProcIDWithBlock(&procID, aggregate.id, nil) { _, inputData, _, outputData, _ in
+            renderer.render(input: inputData, output: outputData)
+        }
+        guard status == noErr, let procID else { throw AudioSessionError.operatingSystem(status, "Creating the audio callback") }
+        ioProcID = procID
+
+        let startStatus = AudioDeviceStart(aggregate.id, procID)
+        guard startStatus == noErr else { throw AudioSessionError.operatingSystem(startStatus, "Starting audio processing") }
+
+        let observer = PropertyObserver()
+        let notify: @Sendable () -> Void = { [weak self] in self?.onDeviceChange?() }
+        observer.add(objectID: output.id, selector: kAudioDevicePropertyNominalSampleRate, handler: notify)
+        observer.add(objectID: output.id, selector: kAudioDevicePropertyDeviceIsAlive, handler: notify)
+        observer.add(objectID: output.id, selector: kAudioDevicePropertyStreamConfiguration, scope: kAudioObjectPropertyScopeOutput, handler: notify)
+        // coreaudiod restarts (driver installs, crashes) destroy the tap and
+        // the aggregate device without any per-device notification.
+        observer.add(objectID: AudioObjectID(kAudioObjectSystemObject), selector: kAudioHardwarePropertyServiceRestarted, handler: notify)
+        self.observer = observer
+
+        return AudioOutputFormat(deviceUID: outputUID, deviceName: outputName, sampleRate: sampleRate, channelCount: channelCount)
+    }
+}
+
+/// Render-thread state, captured by the IOProc block.
+private final class Renderer: @unchecked Sendable {
+    static let capacityFrames = 16_384
+
+    let crossfader: GraphCrossfader
+    let loadPermille = Atomic<Int>(0)
+    private let channelCount: Int
+    private let sampleRate: Double
+    private let tapBufferOffset: Int
+    private let input: UnsafeMutablePointer<Float>
+    private let output: UnsafeMutablePointer<Float>
+    private let ticksToSeconds: Double
+    private var smoothedLoad = 0.0
+
+    init(sampleRate: Double, channelCount: Int, tapBufferOffset: Int) {
+        self.channelCount = channelCount
+        self.sampleRate = sampleRate
+        self.tapBufferOffset = tapBufferOffset
+        crossfader = GraphCrossfader(sampleRate: sampleRate, channelCount: channelCount, maxFrameCount: 4_096)
+        input = .allocate(capacity: Self.capacityFrames * channelCount)
+        output = .allocate(capacity: Self.capacityFrames * channelCount)
+        input.initialize(repeating: 0, count: Self.capacityFrames * channelCount)
+        output.initialize(repeating: 0, count: Self.capacityFrames * channelCount)
+        var timebase = mach_timebase_info_data_t()
+        mach_timebase_info(&timebase)
+        ticksToSeconds = Double(timebase.numer) / Double(timebase.denom) / 1_000_000_000
     }
 
-    private func renderOutput(_ outputData: UnsafeMutablePointer<AudioBufferList>?) {
-        guard let outputData, let scratch = outputScratch, let ring else { return }
-        let buffers = UnsafeMutableAudioBufferListPointer(outputData)
-        let firstBufferChannels = max(1, Int(buffers.first?.mNumberChannels ?? 1))
-        let frames = min(maxFrameCount, buffers.first.map { Int($0.mDataByteSize) / (MemoryLayout<Float>.size * firstBufferChannels) } ?? 0)
+    deinit {
+        input.deinitialize(count: Self.capacityFrames * channelCount)
+        input.deallocate()
+        output.deinitialize(count: Self.capacityFrames * channelCount)
+        output.deallocate()
+    }
+
+    func render(input inputData: UnsafePointer<AudioBufferList>?, output outputData: UnsafeMutablePointer<AudioBufferList>?) {
+        let started = mach_absolute_time()
+        guard let outputData else { return }
+        let outputBuffers = UnsafeMutableAudioBufferListPointer(outputData)
+        guard let first = outputBuffers.first, first.mNumberChannels > 0 else { return }
+        let deviceFrames = Int(first.mDataByteSize) / (MemoryLayout<Float>.size * Int(first.mNumberChannels))
+        let frames = min(deviceFrames, Self.capacityFrames)
         guard frames > 0 else { return }
-        let received = ring.read(to: scratch, frameCount: frames)
-        if received < frames {
-            _ = underruns.wrappingAdd(1, ordering: .relaxed)
-            scratch.advanced(by: received * channelCount).update(repeating: 0, count: (frames - received) * channelCount)
-        }
-        for (index, var buffer) in buffers.enumerated() {
-            guard let data = buffer.mData else { continue }
-            let destination = data.assumingMemoryBound(to: Float.self)
-            let channel = min(index, channelCount - 1)
-            if buffers.count == 1 {
-                destination.update(from: scratch, count: frames * channelCount)
-            } else {
-                for frame in 0..<frames { destination[frame] = scratch[frame * channelCount + channel] }
+
+        gatherTap(inputData, frames: frames)
+        crossfader.process(input: input, output: output, frameCount: frames)
+        scatter(to: outputBuffers, frames: frames, deviceFrames: deviceFrames)
+
+        let elapsed = Double(mach_absolute_time() - started) * ticksToSeconds
+        let load = elapsed / (Double(frames) / sampleRate)
+        smoothedLoad = smoothedLoad * 0.9 + load * 0.1
+        loadPermille.store(Int(smoothedLoad * 1000), ordering: .relaxed)
+    }
+
+    private func gatherTap(_ inputData: UnsafePointer<AudioBufferList>?, frames: Int) {
+        input.update(repeating: 0, count: frames * channelCount)
+        guard let inputData else { return }
+        let buffers = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inputData))
+        guard tapBufferOffset < buffers.count else { return }
+        var channel = 0
+        for index in tapBufferOffset..<buffers.count {
+            let buffer = buffers[index]
+            let bufferChannels = Int(buffer.mNumberChannels)
+            guard bufferChannels > 0, let data = buffer.mData?.assumingMemoryBound(to: Float.self) else {
+                channel += bufferChannels
+                continue
             }
-            buffer.mDataByteSize = UInt32(frames * channelCount * MemoryLayout<Float>.size)
+            let available = min(frames, Int(buffer.mDataByteSize) / (MemoryLayout<Float>.size * bufferChannels))
+            for bufferChannel in 0..<bufferChannels where channel + bufferChannel < channelCount {
+                let destination = channel + bufferChannel
+                for frame in 0..<available {
+                    input[frame * channelCount + destination] = data[frame * bufferChannels + bufferChannel]
+                }
+            }
+            channel += bufferChannels
+        }
+    }
+
+    private func scatter(to buffers: UnsafeMutableAudioBufferListPointer, frames: Int, deviceFrames: Int) {
+        var channel = 0
+        for buffer in buffers {
+            let bufferChannels = Int(buffer.mNumberChannels)
+            guard bufferChannels > 0, let data = buffer.mData?.assumingMemoryBound(to: Float.self) else {
+                channel += bufferChannels
+                continue
+            }
+            let capacity = Int(buffer.mDataByteSize) / (MemoryLayout<Float>.size * bufferChannels)
+            for bufferChannel in 0..<bufferChannels {
+                let source = channel + bufferChannel
+                for frame in 0..<min(frames, capacity) {
+                    data[frame * bufferChannels + bufferChannel] = source < channelCount ? output[frame * channelCount + source] : 0
+                }
+            }
+            if capacity > frames {
+                (data + frames * bufferChannels).update(repeating: 0, count: (capacity - frames) * bufferChannels)
+            }
+            channel += bufferChannels
+        }
+    }
+}
+
+/// Registers Core Audio property listeners and removes them on deinit.
+private final class PropertyObserver: @unchecked Sendable {
+    private var registrations: [(AudioObjectID, AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)] = []
+
+    func add(
+        objectID: AudioObjectID,
+        selector: AudioObjectPropertySelector,
+        scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal,
+        handler: @escaping @Sendable () -> Void
+    ) {
+        var address = AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: kAudioObjectPropertyElementMain)
+        let block: AudioObjectPropertyListenerBlock = { _, _ in handler() }
+        if AudioObjectAddPropertyListenerBlock(objectID, &address, DispatchQueue.main, block) == noErr {
+            registrations.append((objectID, address, block))
+        }
+    }
+
+    deinit {
+        for (objectID, address, block) in registrations {
+            var address = address
+            AudioObjectRemovePropertyListenerBlock(objectID, &address, DispatchQueue.main, block)
         }
     }
 }

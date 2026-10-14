@@ -10,7 +10,20 @@ public struct DefaultAPOCompiler: APOCompiler {
     ) async -> Result<PreparedGraph, ConfigurationDiagnostics> {
         await Task.detached(priority: .userInitiated) {
             var worker = CompilerWorker(profileRoot: profileRoot, environment: environment)
-            return worker.run()
+            return worker.run(rootSource: nil)
+        }.value
+    }
+
+    /// Compiles unsaved text as if it were stored at `sourceURL`, so relative
+    /// Include and Convolution paths resolve against the profile directory.
+    public func compile(
+        source: String,
+        sourceURL: URL,
+        environment: APOEnvironment
+    ) async -> Result<PreparedGraph, ConfigurationDiagnostics> {
+        await Task.detached(priority: .userInitiated) {
+            var worker = CompilerWorker(profileRoot: sourceURL, environment: environment)
+            return worker.run(rootSource: source)
         }.value
     }
 }
@@ -40,7 +53,7 @@ private struct CompilerWorker {
         self.expression = ExpressionEvaluator(context: ExpressionContext(environment: environment))
     }
 
-    mutating func run() -> Result<PreparedGraph, ConfigurationDiagnostics> {
+    mutating func run(rootSource: String?) -> Result<PreparedGraph, ConfigurationDiagnostics> {
         let configURL: URL
         if profileRoot.pathExtension.lowercased() == "txt" {
             configURL = profileRoot
@@ -48,7 +61,11 @@ private struct CompilerWorker {
             configURL = profileRoot.appendingPathComponent("config.txt")
         }
 
-        process(file: configURL)
+        if let rootSource {
+            process(document: APOConfigurationFile(url: configURL, text: rootSource), url: configURL)
+        } else {
+            process(file: configURL)
+        }
         if !conditionalStack.isEmpty {
             diagnostics.append(ConfigurationDiagnostic(
                 severity: .error,
@@ -105,7 +122,11 @@ private struct CompilerWorker {
             ))
             return
         }
+        process(document: document, url: url)
+    }
 
+    private mutating func process(document: APOConfigurationFile, url: URL) {
+        let canonicalURL = url.standardizedFileURL.resolvingSymlinksInPath()
         includeStack.append(canonicalURL)
         for line in document.lines {
             process(line: SourceLine(line), currentFile: url)
@@ -202,7 +223,7 @@ private struct CompilerWorker {
         do {
             value = try expandInlineExpressions(rawValue, source: source)
         } catch {
-            addError("Invalid inline expression: (error.localizedDescription)", source: source, code: "expression")
+            addError("Invalid inline expression: \(error.localizedDescription)", source: source, code: "expression")
             return
         }
 
@@ -214,9 +235,10 @@ private struct CompilerWorker {
                 addError("Include path is empty", source: source, code: "include-path")
                 return
             }
-            let includeURL = URL(fileURLWithPath: includePath, relativeTo: currentFile.deletingLastPathComponent()).standardizedFileURL
-            process(file: includeURL)
+            process(file: resolvePath(includePath, currentFile: currentFile, source: source))
         case "device":
+            // A Device line inside an inactive If branch must not change the selection.
+            guard active else { return }
             let candidates = splitTopLevel(value, separator: ";")
             let metadata = [environment.deviceName, environment.connectionName, environment.deviceUID].joined(separator: " ").lowercased()
             deviceMatches = candidates.contains { candidate in
@@ -273,7 +295,8 @@ private struct CompilerWorker {
         case "graphiceq":
             guard processingActive else { return }
             guard let node = parseGraphicEQ(value, source: source) else { return }
-            add(node, scoped: true)
+            // The node carries its own per-channel filters for the Channel scope.
+            add(node, scoped: false)
         case "convolution":
             guard processingActive else { return }
             guard let node = parseConvolution(value, source: source, currentFile: currentFile) else { return }
@@ -462,53 +485,51 @@ private struct CompilerWorker {
             return nil
         }
         let impulse = GraphicEQBuilder.impulseResponse(bands: bands, sampleRate: environment.sampleRate)
-        return FIRNode(filter: impulse, channelCount: max(1, environment.outputChannelCount), maxFrameCount: environment.maxFrameCount, displayName: "GraphicEQ")
+        let count = max(1, environment.outputChannelCount)
+        var filters = [[Float]?](repeating: nil, count: count)
+        for channel in selectedChannels where channel >= 0 && channel < count {
+            filters[channel] = impulse
+        }
+        return ConvolutionNode(filters: filters, channelCount: count, displayName: "GraphicEQ" + channelSuffix())
     }
 
     private mutating func parseConvolution(_ value: String, source: SourceLine, currentFile: URL) -> RenderNode? {
         let path = unquote(value.trimmingCharacters(in: .whitespacesAndNewlines))
-        let url = URL(fileURLWithPath: path, relativeTo: currentFile.deletingLastPathComponent()).standardizedFileURL
+        guard !path.isEmpty else {
+            addError("Convolution requires an impulse response file", source: source, code: "convolution")
+            return nil
+        }
+        let url = resolvePath(path, currentFile: currentFile, source: source)
         do {
-            let impulse = try loadImpulseResponse(url: url)
-            guard abs(impulse.sampleRate - environment.sampleRate) < 0.5 else {
-                addError("Convolution sample rate \(impulse.sampleRate) Hz does not match device rate \(environment.sampleRate) Hz", source: source, code: "convolution-rate")
-                return nil
+            let impulse = try ImpulseResponseLoader.load(url: url, targetSampleRate: environment.sampleRate)
+            if impulse.wasResampled {
+                addWarning("Resampled \(url.lastPathComponent) from \(Int(impulse.sourceSampleRate)) Hz to \(Int(environment.sampleRate)) Hz", source: source, code: "convolution-rate")
             }
             let count = max(1, environment.outputChannelCount)
-            let identity = [Float(1)]
-            var filters = Array(repeating: identity, count: count)
+            var filters = [[Float]?](repeating: nil, count: count)
             for (position, channel) in selectedChannels.enumerated() where channel >= 0 && channel < count {
                 filters[channel] = impulse.channels[position % impulse.channels.count]
             }
-            return MultiFIRNode(filters: filters, channelCount: count, maxFrameCount: environment.maxFrameCount, displayName: "Convolution (url.lastPathComponent)")
+            return ConvolutionNode(filters: filters, channelCount: count, displayName: "Convolution \(url.lastPathComponent)" + channelSuffix())
         } catch {
             addError("Unable to load convolution impulse response: \(error.localizedDescription)", source: source, code: "convolution")
             return nil
         }
     }
 
-    private func loadImpulseResponse(url: URL) throws -> (sampleRate: Double, channels: [[Float]]) {
-        let file = try AVAudioFile(forReading: url)
-        let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: file.fileFormat.sampleRate, channels: file.fileFormat.channelCount, interleaved: false)!
-        let capacity = AVAudioFrameCount(max(1, file.length))
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: capacity) else {
-            throw NSError(domain: "APOMac", code: 1, userInfo: [NSLocalizedDescriptionKey: "Unable to allocate impulse response buffer"])
-        }
-        try file.read(into: buffer)
-        guard let channelData = buffer.floatChannelData else {
-            throw NSError(domain: "APOMac", code: 2, userInfo: [NSLocalizedDescriptionKey: "Impulse response is not PCM float audio"])
-        }
-        let frames = Int(buffer.frameLength)
-        let channels = (0..<Int(format.channelCount)).map { channel in
-            Array(UnsafeBufferPointer(start: channelData[channel], count: frames))
-        }
-        return (format.sampleRate, channels.isEmpty ? [[1]] : channels)
+    /// " [L, R]" when a Channel scope narrows processing, otherwise "".
+    private func channelSuffix() -> String {
+        let all = Array(0..<max(1, environment.outputChannelCount))
+        guard selectedChannels != all else { return "" }
+        let names = selectedChannels.map { environment.channelNames.indices.contains($0) ? environment.channelNames[$0] : String($0 + 1) }
+        return " [\(names.joined(separator: ", "))]"
     }
 
     private mutating func add(_ node: RenderNode, scoped: Bool) {
         let allChannels = Array(0..<max(1, environment.outputChannelCount))
         if scoped && selectedChannels != allChannels {
-            nodes.append(ScopedNode(inner: node, selectedChannels: selectedChannels, channelCount: allChannels.count, maxFrameCount: environment.maxFrameCount))
+            let names = selectedChannels.map { environment.channelNames.indices.contains($0) ? environment.channelNames[$0] : String($0 + 1) }
+            nodes.append(ScopedNode(inner: node, selectedChannels: selectedChannels, channelNames: names, channelCount: allChannels.count, maxFrameCount: environment.maxFrameCount))
         } else {
             nodes.append(node)
         }
@@ -574,6 +595,33 @@ private struct CompilerWorker {
             result = result.replacingOccurrences(of: "%\(name)%", with: name)
         }
         return result
+    }
+
+    /// Equalizer APO profiles are written on Windows: separators are
+    /// backslashes and absolute paths usually point into the APO config
+    /// directory. Map those onto the imported profile directory.
+    private mutating func resolvePath(_ rawPath: String, currentFile: URL, source: SourceLine) -> URL {
+        let path = rawPath.replacingOccurrences(of: "\\", with: "/")
+        let baseDirectory = currentFile.deletingLastPathComponent()
+        let isWindowsAbsolute = path.count >= 3
+            && path[path.startIndex].isLetter
+            && path[path.index(after: path.startIndex)] == ":"
+        guard isWindowsAbsolute else {
+            return URL(fileURLWithPath: path, relativeTo: baseDirectory).standardizedFileURL
+        }
+
+        let components = path.dropFirst(2).split(separator: "/").map(String.init)
+        let profileDirectory = profileRoot.pathExtension.lowercased() == "txt" ? profileRoot.deletingLastPathComponent() : profileRoot
+        var candidates: [URL] = []
+        if let configIndex = components.lastIndex(where: { $0.lowercased() == "config" }), configIndex + 1 < components.count {
+            candidates.append(components[(configIndex + 1)...].reduce(profileDirectory) { $0.appendingPathComponent($1) })
+        }
+        if let last = components.last {
+            candidates.append(baseDirectory.appendingPathComponent(last))
+        }
+        let mapped = candidates.first { FileManager.default.fileExists(atPath: $0.path) } ?? candidates.first ?? baseDirectory
+        addWarning("Windows path '\(rawPath)' was mapped to \(mapped.lastPathComponent) in this profile", source: source, code: "windows-path")
+        return mapped.standardizedFileURL
     }
 
     private func unquote(_ value: String) -> String {

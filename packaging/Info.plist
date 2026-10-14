@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleDisplayName</key>
+  <string>APOMac</string>
+  <key>CFBundleExecutable</key>
+  <string>APOMac</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.apomac.app</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>APOMac</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.0.0</string>
+  <key>CFBundleVersion</key>
+  <string>0</string>
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.music</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>15.0</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+  <key>NSHumanReadableCopyright</key>
+  <string>APOMac is free software, licensed under the GNU GPL v2. Based on Equalizer APO © Jonas Thedering and contributors.</string>
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>APOMac captures the audio other apps play so it can apply your equalizer before it reaches your speakers or headphones.</string>
+</dict>
+</plist>
