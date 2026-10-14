@@ -1,0 +1,9 @@
+APOMac is licensed under the GNU General Public License, version 2 only.
+
+This project contains a platform port/reimplementation of Equalizer APO
+processing behavior and retains the applicable copyright notices and
+source-availability obligations. See NOTICE.md for attribution.
+
+The complete GPL-2.0 license text is available at:
+
+https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt

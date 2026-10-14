@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>com.apomac.app</string>
+  <key>CFBundleDisplayName</key>
+  <string>APOMac</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>15.0</string>
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>APOMac captures system audio so it can apply your Equalizer APO-compatible profile before playback.</string>
+</dict>
+</plist>
