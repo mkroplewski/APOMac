@@ -25,7 +25,16 @@ let package = Package(
         .executableTarget(
             name: "APOMacApp",
             dependencies: ["APOEngine", "APOAudioRuntime"],
-            path: "Sources/APOMacApp"
+            path: "Sources/APOMacApp",
+            linkerSettings: [
+                // Work around SwiftPM's swiftbuild backend recording SDK 15.0,
+                // which makes AppKit use the older toolbar appearance. Opt in
+                // to the macOS 26 appearance while keeping macOS 15 support.
+                .unsafeFlags([
+                    "-Xlinker", "-platform_version", "-Xlinker", "macos",
+                    "-Xlinker", "15.0", "-Xlinker", "26.0"
+                ])
+            ]
         ),
         .testTarget(
             name: "APOEngineTests",

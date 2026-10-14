@@ -13,7 +13,7 @@
   <a href="https://github.com/mkroplewski/APOMac/releases/latest"><b>Download the latest release</b></a>
 </p>
 
-![APOMac showing an AutoEQ headphone profile](docs/screenshot.png)
+![APOMac in dark mode showing a headphone EQ profile](docs/screenshot.png)
 
 ## Features
 

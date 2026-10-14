@@ -98,6 +98,7 @@ struct ContentView: View {
         ToolbarItemGroup(placement: .primaryAction) {
             OutputDevicePicker(model: model)
                 .pickerStyle(.menu)
+                .labelStyle(.titleOnly)
                 .help("macOS sound output — APOMac processes whatever plays through it")
                 .frame(minWidth: 170)
 
