@@ -239,12 +239,12 @@ private struct CompilerWorker {
         case "device":
             // A Device line inside an inactive If branch must not change the selection.
             guard active else { return }
-            let candidates = splitTopLevel(value, separator: ";")
-            let metadata = [environment.deviceName, environment.connectionName, environment.deviceUID].joined(separator: " ").lowercased()
-            deviceMatches = candidates.contains { candidate in
-                let pattern = candidate.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-                return pattern == "all" || splitWhitespace(pattern).allSatisfy { metadata.contains($0) }
-            }
+            deviceMatches = DeviceSelector.matches(
+                value,
+                deviceName: environment.deviceName,
+                connectionName: environment.connectionName,
+                deviceUID: environment.deviceUID
+            )
         case "channel":
             guard active && deviceMatches && stageMatches else { return }
             let tokens = value.replacingOccurrences(of: ",", with: " ").split { $0 == " " || $0 == "\t" }.map(String.init)

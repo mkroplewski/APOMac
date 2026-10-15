@@ -53,6 +53,8 @@ struct ResponseGraphView: View {
     let filters: [EditableFilter]
     let selectedFilterID: UUID?
     let isBypassed: Bool
+    /// The output's name when the profile is for another device.
+    var unprocessedOutput: String?
     let isEditable: Bool
     let onSelect: (UUID) -> Void
     let onDrag: (_ filter: EditableFilter, _ frequency: Double, _ gainDB: Double, _ isFirstChange: Bool) -> Void
@@ -167,7 +169,7 @@ struct ResponseGraphView: View {
     private func drawCurves(in context: inout GraphicsContext, geometry: GraphGeometry) {
         guard !responses.isEmpty else { return }
         let plot = geometry.plot
-        let opacity = isBypassed ? 0.35 : 1.0
+        let opacity = isBypassed || unprocessedOutput != nil ? 0.35 : 1.0
         context.clip(to: Path(plot.insetBy(dx: -1, dy: -1)))
 
         if channelsDiffer {
@@ -224,14 +226,18 @@ struct ResponseGraphView: View {
             }
             if isBypassed {
                 Label("Bypassed", systemImage: "power.dotted").foregroundStyle(.orange)
+            } else if let unprocessedOutput {
+                Label("Not applied on \(unprocessedOutput)", systemImage: "speaker.slash").foregroundStyle(.orange)
             }
         }
         .font(.caption)
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
         .background(.thinMaterial, in: Capsule())
-        .opacity(channelsDiffer || isBypassed ? 1 : 0)
-        .position(x: geometry.plot.maxX - 80, y: geometry.plot.minY + 16)
+        .opacity(channelsDiffer || isBypassed || unprocessedOutput != nil ? 1 : 0)
+        .fixedSize()
+        .frame(width: max(0, geometry.plot.width - 16), alignment: .trailing)
+        .position(x: geometry.plot.midX, y: geometry.plot.minY + 16)
         .allowsHitTesting(false)
     }
 

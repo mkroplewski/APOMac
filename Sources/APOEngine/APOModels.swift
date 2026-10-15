@@ -7,6 +7,8 @@ public enum APOStage: String, Sendable, Equatable, CaseIterable {
 }
 
 public struct APOEnvironment: Sendable, Equatable {
+    public static let defaultConnectionName = "Core Audio output"
+
     public let sampleRate: Double
     public let inputChannelCount: Int
     public let outputChannelCount: Int
@@ -22,7 +24,7 @@ public struct APOEnvironment: Sendable, Equatable {
         inputChannelCount: Int,
         outputChannelCount: Int,
         deviceName: String,
-        connectionName: String = "Core Audio output",
+        connectionName: String = APOEnvironment.defaultConnectionName,
         deviceUID: String = "",
         channelNames: [String] = [],
         stage: APOStage = .postMix,
@@ -39,6 +41,25 @@ public struct APOEnvironment: Sendable, Equatable {
             : channelNames
         self.stage = stage
         self.maxFrameCount = max(1, maxFrameCount)
+    }
+}
+
+/// Equalizer APO's `Device:` selection. The value lists alternatives
+/// separated by ";"; one matches when each of its words occurs in the
+/// device's name, connection name or identifier (case-insensitive), or when
+/// it is "all".
+public enum DeviceSelector {
+    public static func matches(
+        _ value: String,
+        deviceName: String,
+        connectionName: String = APOEnvironment.defaultConnectionName,
+        deviceUID: String
+    ) -> Bool {
+        let metadata = [deviceName, connectionName, deviceUID].joined(separator: " ").lowercased()
+        return splitTopLevel(value, separator: ";").contains { candidate in
+            let pattern = candidate.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return pattern == "all" || splitWhitespace(pattern).allSatisfy { metadata.contains($0) }
+        }
     }
 }
 

@@ -187,12 +187,23 @@ struct VisualEditorParseResult {
     }
 }
 
+/// The output device a profile is limited to.
+enum ProfileDeviceRule: Equatable {
+    case anyDevice
+    /// A `Device:` value, normally a device name.
+    case device(String)
+    /// `Device:` lines the app doesn't manage, such as sections for several
+    /// devices; the compiler applies them as written.
+    case custom
+}
+
 enum FilterEditorParser {
     static func parse(_ text: String) -> VisualEditorParseResult {
         let lines = normalizedLines(text)
+        let deviceLine = deviceLineIndex(in: lines)
         var filters: [EditableFilter] = []
 
-        for (lineIndex, rawLine) in lines.enumerated() {
+        for (lineIndex, rawLine) in lines.enumerated() where lineIndex != deviceLine {
             let (code, comment) = splitComment(rawLine)
             let uncommented = code.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !uncommented.isEmpty, !uncommented.hasPrefix("//") else { continue }
@@ -284,6 +295,76 @@ enum FilterEditorParser {
         if normalized.hasPrefix("+") { normalized.removeFirst() }
         guard let value = Double(normalized), value.isFinite else { return nil }
         return value * multiplier
+    }
+
+    // MARK: Profile device
+
+    static func deviceRule(in text: String) -> ProfileDeviceRule {
+        let lines = normalizedLines(text)
+        if let index = deviceLineIndex(in: lines), let value = command(in: lines[index])?.value {
+            let value = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            return value.isEmpty || value.lowercased() == "all" ? .anyDevice : .device(value)
+        }
+        return lines.contains { command(in: $0).map(isDevice) == true } ? .custom : .anyDevice
+    }
+
+    /// Sets the profile's leading `Device:` line to `deviceName`, or removes
+    /// it (nil). Returns nil when the profile has `Device:` lines of its own.
+    static func settingDevice(_ deviceName: String?, in text: String) -> String? {
+        var lines = normalizedLines(text)
+        if let index = deviceLineIndex(in: lines) {
+            if let deviceName {
+                lines[index] = "Device: \(sanitizedDeviceValue(deviceName))" + splitComment(lines[index]).comment
+            } else {
+                lines.remove(at: index)
+            }
+        } else if lines.contains(where: { command(in: $0).map(isDevice) == true }) {
+            return nil
+        } else if let deviceName {
+            // Ahead of every command, after leading comments.
+            let end = lines.last == "" ? lines.count - 1 : lines.count
+            let index = lines.firstIndex { command(in: $0) != nil } ?? max(0, end)
+            lines.insert("Device: \(sanitizedDeviceValue(deviceName))", at: index)
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// Where a Preamp goes: ahead of the filters, after leading comments and
+    /// the profile's `Device:` line.
+    static func preambleEnd(_ lines: [String]) -> Int {
+        if let deviceLine = deviceLineIndex(in: lines) { return deviceLine + 1 }
+        return lines.firstIndex { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("#") && !$0.trimmingCharacters(in: .whitespaces).isEmpty } ?? lines.count
+    }
+
+    /// The profile's device line: a `Device:` line ahead of every other
+    /// command that is the profile's only `Device:` line.
+    private static func deviceLineIndex(in lines: [String]) -> Int? {
+        var firstCommand: Int?
+        var deviceLines: [Int] = []
+        for (index, line) in lines.enumerated() {
+            guard let command = command(in: line) else { continue }
+            if firstCommand == nil { firstCommand = index }
+            if isDevice(command) { deviceLines.append(index) }
+        }
+        guard deviceLines.count == 1, deviceLines.first == firstCommand else { return nil }
+        return firstCommand
+    }
+
+    private static func command(in line: String) -> (name: String, value: String)? {
+        let code = splitComment(line).code.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !code.isEmpty, !code.hasPrefix("//") else { return nil }
+        return commandAndValue(code)
+    }
+
+    private static func isDevice(_ command: (name: String, value: String)) -> Bool {
+        command.name.lowercased().split(separator: " ").first == "device"
+    }
+
+    /// ";" separates alternatives, "#" starts a comment and backticks an
+    /// inline expression.
+    private static func sanitizedDeviceValue(_ name: String) -> String {
+        name.replacingOccurrences(of: "[;#`]", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespaces)
     }
 
     static func normalizedLines(_ text: String) -> [String] {
