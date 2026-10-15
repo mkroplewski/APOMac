@@ -5,10 +5,16 @@ struct FilterListView: View {
     let showSource: () -> Void
 
     var body: some View {
-        if model.visualEditorAvailable {
-            editor
-        } else {
-            EffectiveChainView(message: model.visualEditorMessage, nodeNames: model.nodeNames, showSource: showSource)
+        VStack(spacing: 0) {
+            if let profile = model.selectedProfile {
+                DeviceRow(model: model, profile: profile)
+                Divider()
+            }
+            if model.visualEditorAvailable {
+                editor
+            } else {
+                EffectiveChainView(message: model.visualEditorMessage, nodeNames: model.nodeNames, showSource: showSource)
+            }
         }
     }
 
@@ -68,6 +74,47 @@ struct FilterListView: View {
                 }
             }
         }
+    }
+}
+
+/// The profile's `Device:` line: which output it applies to, and whether
+/// that is the current one.
+private struct DeviceRow: View {
+    @ObservedObject var model: AppModel
+    let profile: ManagedProfile
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Image(systemName: "hifispeaker")
+                .foregroundStyle(.secondary)
+                .frame(width: FilterRowLayout.badge)
+            Text("Device")
+                .frame(width: FilterRowLayout.type, alignment: .leading)
+                .padding(.leading, FilterRowLayout.toggle + 8)
+            if model.deviceRule(for: profile) == .custom {
+                Text("Set by Device lines in the source").foregroundStyle(.secondary)
+            } else {
+                ProfileDevicePicker(model: model, profile: profile)
+                    .fixedSize()
+                    .help("Apply this profile only when this device is the macOS output")
+            }
+            if !model.selectedProfileApplies {
+                Label("Not applied on \(model.outputDevice?.name ?? "this output")", systemImage: "speaker.slash")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .lineLimit(1)
+                    .padding(.leading, 12)
+                if let target = model.connectedDevice(for: profile) {
+                    Button("Switch Output") { model.selectOutputDevice(target.uid) }
+                        .controlSize(.small)
+                        .padding(.leading, 8)
+                        .help("Make \(target.name) the macOS output")
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 6)
     }
 }
 

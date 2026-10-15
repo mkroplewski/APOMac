@@ -288,6 +288,14 @@ final class APOEngineTests: XCTestCase {
         XCTAssertFalse(diagnostics.diagnostics[0].message.contains("(error"))
     }
 
+    func testDeviceSelectorMatchesWordsAndAlternatives() {
+        XCTAssertTrue(DeviceSelector.matches("hd 650", deviceName: "Sennheiser HD 650", deviceUID: "usb-1"))
+        XCTAssertTrue(DeviceSelector.matches("AirPods; HD 650", deviceName: "Sennheiser HD 650", deviceUID: "usb-1"))
+        XCTAssertTrue(DeviceSelector.matches("usb-1", deviceName: "Sennheiser HD 650", deviceUID: "usb-1"))
+        XCTAssertTrue(DeviceSelector.matches("all", deviceName: "Anything", deviceUID: ""))
+        XCTAssertFalse(DeviceSelector.matches("HD 600", deviceName: "Sennheiser HD 650", deviceUID: "usb-1"))
+    }
+
     func testDeviceLineInsideInactiveBranchIsIgnored() async throws {
         let directory = try makeProfile("""
         If: 1 == 2

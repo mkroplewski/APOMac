@@ -19,6 +19,7 @@
 
 - **Equalizes every app.** APOMac processes everything playing through your current Mac output: speakers, headphones, USB DACs, AirPods.
 - **Uses Equalizer APO profiles.** Import an Equalizer APO profile folder or a single file such as an [AutoEQ](https://autoeq.app) `ParametricEQ.txt`. Your existing Windows configurations work as they are.
+- **Profiles per output device.** Give a profile an output device and APOMac switches to it whenever that device becomes the output, for example when you plug in your headphones.
 - **Changes apply instantly.** Drag a band on the graph, type a value, or edit the source: you hear the change within milliseconds, with a click-free crossfade.
 - **Visual and source editing.** Simple profiles are edited visually. Advanced ones (`Include`, `If`, `Channel`, `GraphicEQ`, `Convolution`, …) are edited as text, with syntax highlighting, error checking and a live response graph.
 - **Stays out of the way.** It lives in the menu bar when its window is closed, can open at login, and uses a few percent of one CPU core even with long convolution filters.
@@ -62,6 +63,14 @@ Quit APOMac from its menu bar icon and move it to the Trash; its login item goes
 - Changes are saved automatically. If the source has an error, the last working version keeps playing.
 
 **Output device.** APOMac always processes the macOS sound output, because that's where apps send their audio. The output picker in the toolbar and the menu bar switches the macOS output, and changing it elsewhere (Control Center, plugging in headphones) is followed automatically.
+
+**Profiles for one device.** Choose a **Device** at the top of the Filters list (or **Output Device** in a profile's menu) to limit the profile to one output, such as your headphones. APOMac stores this as an Equalizer APO `Device:` line at the top of the profile, so the profile still works as-is in Equalizer APO. When the macOS output changes, APOMac selects:
+
+1. a profile for the new device (the one you last used with it, if there are several);
+2. otherwise, a profile without an output device;
+3. otherwise nothing changes, and the output plays unprocessed.
+
+If you select a profile for another device yourself, the current output plays unprocessed: the graph is dimmed and marked *Not applied*, and the Device row offers to switch the output. Profiles with several `Device:` sections are left to their source and count as profiles for any device.
 
 **Comparing.** **Bypass** (⌘B) crossfades to the unprocessed sound so you can compare. **Processing** (⇧⌘E) turns APOMac off completely.
 

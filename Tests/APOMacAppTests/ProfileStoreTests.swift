@@ -209,6 +209,80 @@ final class ProfileStoreTests: XCTestCase {
         XCTAssertFalse(FilterEditorParser.parse("Channel: L\nPreamp: -1 dB\n").isEditable)
     }
 
+    func testProfileDeviceLineIsASettingNotASourceOnlyCommand() throws {
+        let text = "# Headphones\nDevice: HD 650 # wired\nFilter 1: ON PK Fc 1000 Hz Gain 3 dB Q 1\n"
+        XCTAssertEqual(FilterEditorParser.deviceRule(in: text), .device("HD 650"))
+        let result = FilterEditorParser.parse(text)
+        XCTAssertTrue(result.isEditable)
+        XCTAssertEqual(result.filters.map(\.lineIndex), [2])
+
+        // Replacing keeps the comment; removing drops the line.
+        XCTAssertEqual(
+            FilterEditorParser.settingDevice("MacBook Pro Speakers", in: text),
+            "# Headphones\nDevice: MacBook Pro Speakers # wired\nFilter 1: ON PK Fc 1000 Hz Gain 3 dB Q 1\n"
+        )
+        XCTAssertEqual(FilterEditorParser.settingDevice(nil, in: text), "# Headphones\nFilter 1: ON PK Fc 1000 Hz Gain 3 dB Q 1\n")
+        // Added ahead of every command, after leading comments; separators are dropped.
+        XCTAssertEqual(
+            FilterEditorParser.settingDevice("A;B", in: "# c\nPreamp: -1 dB\n"),
+            "# c\nDevice: A B\nPreamp: -1 dB\n"
+        )
+        XCTAssertEqual(FilterEditorParser.settingDevice("A", in: ""), "Device: A\n")
+        XCTAssertEqual(FilterEditorParser.deviceRule(in: "Device: all\nPreamp: 0 dB\n"), .anyDevice)
+
+        // A preamp goes after the device line so it stays limited to the device.
+        let lines = FilterEditorParser.normalizedLines(text)
+        XCTAssertEqual(FilterEditorParser.preambleEnd(lines), 2)
+
+        // Device lines the app doesn't manage stay in the source.
+        for custom in ["Preamp: -1 dB\nDevice: A\n", "Device: A\nPreamp: -1 dB\nDevice: B\nPreamp: -2 dB\n"] {
+            XCTAssertEqual(FilterEditorParser.deviceRule(in: custom), .custom)
+            XCTAssertNil(FilterEditorParser.settingDevice("C", in: custom))
+            XCTAssertFalse(FilterEditorParser.parse(custom).isEditable)
+        }
+    }
+
+    @MainActor
+    func testOutputChangesSelectTheProfileForTheDevice() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("APOMacDevices-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ProfileStore(profilesDirectory: root)
+        let general = try store.create(name: "General")
+        let flat = try store.create(name: "HD 650 Flat")
+        let bass = try store.create(name: "HD 650 Bass")
+        let speakers = try store.create(name: "Speakers")
+        try store.writeConfiguration("Device: HD 650\nPreamp: -1 dB\n", for: flat)
+        try store.writeConfiguration("Device: HD 650\nPreamp: -2 dB\n", for: bass)
+        let defaults = UserDefaults(suiteName: "APOMacDevices-\(UUID().uuidString)")!
+        let model = AppModel(store: store, defaults: defaults, startsAudio: false)
+        model.setOutputDevice("MacBook Pro Speakers", for: model.profiles.first { $0.id == speakers.id }!)
+        XCTAssertEqual(model.deviceRules[speakers.id], .device("MacBook Pro Speakers"))
+
+        // A profile for the device wins over one for any device.
+        model.selectProfile(general.id)
+        model.selectProfile(forOutputNamed: "Sennheiser HD 650", uid: "usb-1")
+        XCTAssertEqual(model.selectedProfileID, bass.id)
+        // The one last used with the device is preferred among several.
+        model.selectProfile(forOutputNamed: "MacBook Pro Speakers", uid: "builtin")
+        XCTAssertEqual(model.selectedProfileID, speakers.id)
+        model.selectProfile(forOutputNamed: "Sennheiser HD 650", uid: "usb-1")
+        model.selectProfile(flat.id)
+        model.selectProfile(forOutputNamed: "MacBook Pro Speakers", uid: "builtin")
+        model.selectProfile(forOutputNamed: "Sennheiser HD 650", uid: "usb-1")
+        XCTAssertEqual(model.selectedProfileID, flat.id)
+        // No profile for the device: fall back to one for any device.
+        model.selectProfile(forOutputNamed: "AirPods", uid: "bt-1")
+        XCTAssertEqual(model.selectedProfileID, general.id)
+
+        // With no profile for any device either, the selection stays and is
+        // not applied (the output plays unprocessed).
+        model.setOutputDevice("Studio Monitors", for: model.profiles.first { $0.id == general.id }!)
+        model.selectProfile(forOutputNamed: "MacBook Pro Speakers", uid: "builtin")
+        model.selectProfile(forOutputNamed: "AirPods", uid: "bt-1")
+        XCTAssertEqual(model.selectedProfileID, speakers.id)
+        XCTAssertNil(model.preferredProfile(forOutputNamed: "AirPods", uid: "bt-1", current: nil))
+    }
+
     func testUserNumberParsingAcceptsCommasAndSuffixes() {
         XCTAssertEqual(FilterEditorParser.userNumber("2,5"), 2.5)
         XCTAssertEqual(FilterEditorParser.userNumber("1.2k"), 1_200)

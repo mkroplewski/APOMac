@@ -13,8 +13,12 @@ enum EngineStatus: Equatable {
 @MainActor
 final class AppModel: ObservableObject {
     // Library
-    @Published private(set) var profiles: [ManagedProfile] = []
+    @Published private(set) var profiles: [ManagedProfile] = [] {
+        didSet { refreshDeviceRules() }
+    }
     @Published private(set) var selectedProfileID: UUID?
+    /// Each profile's output device, from its leading `Device:` line.
+    @Published private(set) var deviceRules: [UUID: ProfileDeviceRule] = [:]
 
     // Output
     @Published private(set) var devices: [AudioDeviceInfo] = []
@@ -66,11 +70,16 @@ final class AppModel: ObservableObject {
     private var libraryWatcher: FileWatcher?
     private var profileWatchers: [FileWatcher] = []
     private var supportingFilesSignature: Date?
+    /// The output profiles were last chosen for; selections are remembered
+    /// against it.
+    private var followedOutput: (name: String, uid: String)?
 
     private enum Keys {
         static let profile = "selectedProfileName"
         static let legacyProfileID = "selectedProfileID"
         static let enabled = "isEnabled"
+        /// Output device UID → the profile last used with it.
+        static let profileByOutput = "profileByOutput"
     }
 
     /// `startsAudio: false` keeps the model away from Core Audio (tests, previews).
@@ -84,13 +93,16 @@ final class AppModel: ObservableObject {
 
         refreshDevices()
         profiles = store.list()
+        refreshDeviceRules() // Property observers don't run in init.
         var savedName = defaults.string(forKey: Keys.profile)
         if savedName == nil, let legacyID = defaults.string(forKey: Keys.legacyProfileID) {
             savedName = store.migratedProfileNames[legacyID.uppercased()]
         }
         defaults.removeObject(forKey: Keys.legacyProfileID)
         let saved = savedName.flatMap { name in profiles.first { $0.name.caseInsensitiveCompare(name) == .orderedSame } }
-        if let profile = saved ?? profiles.first {
+        followedOutput = outputDevice.map { ($0.name, $0.uid) }
+        let forOutput = followedOutput.flatMap { preferredProfile(forOutputNamed: $0.name, uid: $0.uid, current: saved) }
+        if let profile = forOutput ?? saved ?? profiles.first {
             load(profile)
         }
         libraryWatcher = FileWatcher(url: store.profilesDirectory) { [weak self] in
@@ -118,6 +130,9 @@ final class AppModel: ObservableObject {
 
     var selectedProfile: ManagedProfile? { profiles.first { $0.id == selectedProfileID } }
 
+    /// The macOS sound output.
+    var outputDevice: AudioDeviceInfo? { devices.first { $0.uid == defaultDeviceUID } }
+
     /// Switches the macOS output; processing follows via the default-device
     /// notification.
     func selectOutputDevice(_ uid: String) {
@@ -133,6 +148,23 @@ final class AppModel: ObservableObject {
     /// Highest gain of the compiled response across channels.
     var peakGainDB: Double? {
         responses.flatMap { $0.map(\.magnitudeDB) }.max()
+    }
+
+    func deviceRule(for profile: ManagedProfile) -> ProfileDeviceRule {
+        deviceRules[profile.id] ?? .anyDevice
+    }
+
+    /// False when the selected profile is for another output device: the
+    /// current output then plays unprocessed.
+    var selectedProfileApplies: Bool {
+        guard let profile = selectedProfile, let output = outputDevice else { return true }
+        return applies(profile, toOutputNamed: output.name, uid: output.uid)
+    }
+
+    /// A connected device the profile's `Device:` line matches.
+    func connectedDevice(for profile: ManagedProfile) -> AudioDeviceInfo? {
+        guard case .device(let value) = deviceRule(for: profile) else { return nil }
+        return devices.first { DeviceSelector.matches(value, deviceName: $0.name, deviceUID: $0.uid) }
     }
 
     var errorCount: Int { diagnostics.filter { $0.severity == .error }.count }
@@ -177,6 +209,7 @@ final class AppModel: ObservableObject {
         if profile.id == selectedProfileID { flushSave() }
         perform {
             let renamed = try store.rename(profile, to: name)
+            profileByOutput = profileByOutput.mapValues { $0.caseInsensitiveCompare(profile.name) == .orderedSame ? renamed.name : $0 }
             profiles = store.list()
             if profile.id == selectedProfileID {
                 // The folder moved: follow it without reloading the document.
@@ -184,6 +217,32 @@ final class AppModel: ObservableObject {
                 defaults.set(renamed.name, forKey: Keys.profile)
                 watchSelectedProfile()
             }
+        }
+    }
+
+    /// Limits the profile to one output device with a leading `Device:`
+    /// line, or removes the line (nil) so it applies to any device.
+    func setOutputDevice(_ deviceName: String?, for profile: ManagedProfile) {
+        if profile.id == selectedProfileID {
+            guard let text = FilterEditorParser.settingDevice(deviceName, in: configurationText), text != configurationText else { return }
+            applyVisualEdit(text, actionName: "Change Output Device", registerUndo: true, requireVisualEditor: false)
+            return
+        }
+        perform {
+            guard let text = FilterEditorParser.settingDevice(deviceName, in: try store.readConfiguration(profile)) else { return }
+            try store.writeConfiguration(text, for: profile)
+            deviceRules[profile.id] = FilterEditorParser.deviceRule(in: text)
+        }
+    }
+
+    /// Selects the profile for the given output: one whose `Device:` line
+    /// matches it, otherwise one without a device. With neither, the
+    /// selection stays and the output plays unprocessed.
+    func selectProfile(forOutputNamed name: String, uid: String) {
+        followedOutput = (name, uid)
+        refreshDeviceRules()
+        if let profile = preferredProfile(forOutputNamed: name, uid: uid, current: selectedProfile) {
+            selectProfile(profile.id)
         }
     }
 
@@ -201,7 +260,7 @@ final class AppModel: ObservableObject {
             profiles = store.list()
             if profile.id == selectedProfileID {
                 selectedProfileID = nil
-                if let next = profiles.first {
+                if let next = profileForOutput() ?? profiles.first {
                     selectProfile(next.id)
                 } else {
                     clearDocument()
@@ -258,9 +317,7 @@ final class AppModel: ObservableObject {
         while lines.count > 1, lines.last?.isEmpty == true { lines.removeLast() }
         if lines == [""] { lines = [] }
         if kind == .preamp {
-            // Keep the preamp ahead of the filters, after leading comments.
-            let insertIndex = lines.firstIndex { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("#") && !$0.trimmingCharacters(in: .whitespaces).isEmpty } ?? lines.count
-            lines.insert(FilterEditorFormatter.line(for: filter), at: insertIndex)
+            lines.insert(FilterEditorFormatter.line(for: filter), at: FilterEditorParser.preambleEnd(lines))
         } else {
             lines.append(FilterEditorFormatter.line(for: filter))
         }
@@ -297,8 +354,7 @@ final class AppModel: ObservableObject {
             return
         }
         var lines = FilterEditorParser.normalizedLines(configurationText)
-        let insertIndex = lines.firstIndex { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("#") && !$0.trimmingCharacters(in: .whitespaces).isEmpty } ?? lines.count
-        lines.insert("Preamp: \(FilterEditorFormatter.decimal(correction, maximumFractionDigits: 1)) dB", at: insertIndex)
+        lines.insert("Preamp: \(FilterEditorFormatter.decimal(correction, maximumFractionDigits: 1)) dB", at: FilterEditorParser.preambleEnd(lines))
         applyVisualEdit(lines.joined(separator: "\n"), actionName: "Add Preamp", registerUndo: true, requireVisualEditor: false)
     }
 
@@ -343,6 +399,9 @@ final class AppModel: ObservableObject {
         refreshVisualEditor()
         undoManager?.removeAllActions()
         watchSelectedProfile()
+        if let output = followedOutput, applies(profile, toOutputNamed: output.name, uid: output.uid) {
+            profileByOutput[output.uid] = profile.name
+        }
     }
 
     /// Watches the open profile's folder (atomic saves, included files) and
@@ -394,7 +453,7 @@ final class AppModel: ObservableObject {
         saveTask?.cancel()
         hasUnsavedChanges = false
         self.selectedProfileID = nil
-        if let next = profiles.first {
+        if let next = profileForOutput() ?? profiles.first {
             selectProfile(next.id)
         } else {
             clearDocument()
@@ -443,9 +502,57 @@ final class AppModel: ObservableObject {
         visualFilters = result.filters
         visualEditorAvailable = result.isEditable
         visualEditorMessage = result.message
+        if let selectedProfileID {
+            let rule = FilterEditorParser.deviceRule(in: configurationText)
+            if deviceRules[selectedProfileID] != rule { deviceRules[selectedProfileID] = rule }
+        }
         if let selectedFilterID, !visualFilters.contains(where: { $0.id == selectedFilterID }) {
             self.selectedFilterID = nil
         }
+    }
+
+    // MARK: Private: output devices
+
+    private var profileByOutput: [String: String] {
+        get { defaults.dictionary(forKey: Keys.profileByOutput) as? [String: String] ?? [:] }
+        set { defaults.set(newValue, forKey: Keys.profileByOutput) }
+    }
+
+    private func applies(_ profile: ManagedProfile, toOutputNamed name: String, uid: String) -> Bool {
+        guard case .device(let value) = deviceRule(for: profile) else { return true }
+        return DeviceSelector.matches(value, deviceName: name, deviceUID: uid)
+    }
+
+    /// Profiles for this device win over profiles for any device. Among
+    /// several, keep the current one, else the one last used with the
+    /// device, else the last selected one, else the first.
+    func preferredProfile(forOutputNamed name: String, uid: String, current: ManagedProfile?) -> ManagedProfile? {
+        let forDevice = profiles.filter {
+            if case .device = deviceRule(for: $0) { return applies($0, toOutputNamed: name, uid: uid) }
+            return false
+        }
+        let candidates = forDevice.isEmpty ? profiles.filter { if case .device = deviceRule(for: $0) { false } else { true } } : forDevice
+        if let current, candidates.contains(current) { return current }
+        for remembered in [profileByOutput[uid], defaults.string(forKey: Keys.profile)].compactMap({ $0 }) {
+            if let profile = candidates.first(where: { $0.name.caseInsensitiveCompare(remembered) == .orderedSame }) {
+                return profile
+            }
+        }
+        return candidates.first
+    }
+
+    private func profileForOutput() -> ManagedProfile? {
+        followedOutput.flatMap { preferredProfile(forOutputNamed: $0.name, uid: $0.uid, current: nil) }
+    }
+
+    /// Reads every profile's `Device:` line; the open one from the editor.
+    private func refreshDeviceRules() {
+        var rules: [UUID: ProfileDeviceRule] = [:]
+        for profile in profiles {
+            let text = profile.id == selectedProfileID ? configurationText : (try? store.readConfiguration(profile)) ?? ""
+            rules[profile.id] = FilterEditorParser.deviceRule(in: text)
+        }
+        if rules != deviceRules { deviceRules = rules }
     }
 
     private func defaultFrequency(for kind: VisualFilterKind) -> Double {
@@ -485,8 +592,9 @@ final class AppModel: ObservableObject {
     // MARK: Private: compile and install
 
     private func makeEnvironment() -> APOEnvironment {
+        var environment: APOEnvironment
         if case .running(let format) = engineStatus {
-            return APOEnvironment(
+            environment = APOEnvironment(
                 sampleRate: format.sampleRate,
                 inputChannelCount: format.channelCount,
                 outputChannelCount: format.channelCount,
@@ -494,16 +602,30 @@ final class AppModel: ObservableObject {
                 deviceUID: format.deviceUID,
                 maxFrameCount: 4_096
             )
+        } else {
+            let device = outputDevice ?? devices.first
+            environment = APOEnvironment(
+                sampleRate: device?.sampleRate ?? 48_000,
+                inputChannelCount: max(1, device?.outputChannelCount ?? 2),
+                outputChannelCount: max(1, device?.outputChannelCount ?? 2),
+                deviceName: device?.name ?? "Output",
+                deviceUID: device?.uid ?? "",
+                maxFrameCount: 4_096
+            )
         }
-        let device = devices.first { $0.uid == defaultDeviceUID } ?? devices.first
-        return APOEnvironment(
-            sampleRate: device?.sampleRate ?? 48_000,
-            inputChannelCount: max(1, device?.outputChannelCount ?? 2),
-            outputChannelCount: max(1, device?.outputChannelCount ?? 2),
-            deviceName: device?.name ?? "Output",
-            deviceUID: device?.uid ?? "",
-            maxFrameCount: 4_096
-        )
+        // A profile for another device is shown as it sounds on that device;
+        // installCurrentGraph keeps it off this one.
+        if let profile = selectedProfile, case .device(let value) = deviceRule(for: profile),
+           !applies(profile, toOutputNamed: environment.deviceName, uid: environment.deviceUID) {
+            environment = APOEnvironment(
+                sampleRate: environment.sampleRate,
+                inputChannelCount: environment.inputChannelCount,
+                outputChannelCount: environment.outputChannelCount,
+                deviceName: value,
+                maxFrameCount: environment.maxFrameCount
+            )
+        }
+        return environment
     }
 
     private func scheduleCompile(after delay: Duration = .zero) {
@@ -560,7 +682,8 @@ final class AppModel: ObservableObject {
 
     private func installCurrentGraph() {
         guard case .running(let format) = engineStatus else { return }
-        if isBypassed || currentGraph == nil {
+        let applies = selectedProfile.map { self.applies($0, toOutputNamed: format.deviceName, uid: format.deviceUID) } ?? true
+        if isBypassed || currentGraph == nil || !applies {
             audioSession.install(graph: .passthrough(channelCount: format.channelCount, maxFrameCount: 4_096, sampleRate: format.sampleRate))
         } else if let currentGraph, !audioSession.install(graph: currentGraph) {
             // Compiled for a previous device format; compile again.
@@ -615,6 +738,9 @@ final class AppModel: ObservableObject {
         let previousDevices = Set(devices.map(\.uid))
         refreshDevices()
         let deviceSetChanged = previousDevices != Set(devices.map(\.uid)) || previousDefault != defaultDeviceUID
+        if previousDefault != defaultDeviceUID, let output = outputDevice {
+            selectProfile(forOutputNamed: output.name, uid: output.uid)
+        }
         guard isEnabled else { return }
         switch engineStatus {
         case .running(let format):

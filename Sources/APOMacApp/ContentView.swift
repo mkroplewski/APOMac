@@ -149,10 +149,21 @@ private struct SidebarView: View {
             Section("Profiles") {
                 ForEach(model.profiles) { profile in
                     HStack {
-                        Label(profile.name, systemImage: "slider.vertical.3")
-                            .lineLimit(1)
+                        Label {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(profile.name).lineLimit(1)
+                                if case .device(let device) = model.deviceRule(for: profile) {
+                                    Text(device)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                            }
+                        } icon: {
+                            Image(systemName: "slider.vertical.3")
+                        }
                         Spacer()
-                        if profile.id == model.selectedProfileID, case .running = model.engineStatus, !model.isBypassed {
+                        if profile.id == model.selectedProfileID, case .running = model.engineStatus, !model.isBypassed, model.selectedProfileApplies {
                             ActivityBars()
                                 .help("Playing through this profile")
                         }
@@ -163,6 +174,8 @@ private struct SidebarView: View {
         }
         .contextMenu(forSelectionType: UUID.self) { ids in
             if let id = ids.first, let profile = model.profiles.first(where: { $0.id == id }) {
+                ProfileDeviceMenu(model: model, profile: profile)
+                Divider()
                 Button("Rename…") { onRename(profile) }
                 Button("Duplicate") { model.duplicate(profile) }
                 Button("Export…") { model.export(profile) }
@@ -193,6 +206,8 @@ private struct SidebarView: View {
                 Spacer()
                 if let profile = model.selectedProfile {
                     Menu {
+                        ProfileDeviceMenu(model: model, profile: profile)
+                        Divider()
                         Button("Rename…") { onRename(profile) }
                         Button("Duplicate") { model.duplicate(profile) }
                         Button("Export…") { model.export(profile) }
@@ -211,6 +226,54 @@ private struct SidebarView: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
         }
+    }
+}
+
+/// Limits a profile to one output device (its leading `Device:` line).
+private struct ProfileDeviceMenu: View {
+    @ObservedObject var model: AppModel
+    let profile: ManagedProfile
+
+    var body: some View {
+        Menu("Output Device") {
+            if model.deviceRule(for: profile) == .custom {
+                Text("Set by Device lines in the source")
+            } else {
+                ProfileDevicePicker(model: model, profile: profile)
+                    .pickerStyle(.inline)
+            }
+        }
+    }
+}
+
+/// Chooses the profile's output device: Any Device or a device name.
+struct ProfileDevicePicker: View {
+    @ObservedObject var model: AppModel
+    let profile: ManagedProfile
+
+    var body: some View {
+        let rule = model.deviceRule(for: profile)
+        Picker("Output Device", selection: Binding(
+            get: { if case .device(let device) = rule { device } else { "" } },
+            set: { model.setOutputDevice($0.isEmpty ? nil : $0, for: profile) }
+        )) {
+            Text("Any Device").tag("")
+            Divider()
+            ForEach(deviceNames(rule), id: \.self) { Text($0).tag($0) }
+        }
+        .labelsHidden()
+    }
+
+    /// Connected outputs, plus the profile's device when it isn't one of them.
+    private func deviceNames(_ rule: ProfileDeviceRule) -> [String] {
+        var names: [String] = []
+        for device in model.devices where !names.contains(device.name) {
+            names.append(device.name)
+        }
+        if case .device(let device) = rule, !names.contains(device) {
+            names.append(device)
+        }
+        return names
     }
 }
 
@@ -248,6 +311,7 @@ private struct DetailView: View {
                 filters: model.visualFilters,
                 selectedFilterID: model.selectedFilterID,
                 isBypassed: model.isBypassed,
+                unprocessedOutput: model.selectedProfileApplies ? nil : model.outputDevice?.name,
                 isEditable: model.visualEditorAvailable,
                 onSelect: { model.selectedFilterID = $0 },
                 onDrag: { filter, frequency, gain, isFirst in
@@ -353,7 +417,7 @@ private struct EngineBanner: View {
                 Image(systemName: icon).font(.title3).foregroundStyle(tint)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(title).font(.callout.weight(.semibold))
-                    Text(detail).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(2)
                 }
                 Spacer()
                 actions()
